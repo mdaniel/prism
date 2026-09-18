@@ -182,11 +182,12 @@ impl Drop for HoldEventGuard {
 pub struct Gateway {
     pub(crate) config_path: PathBuf,
     pub(crate) config: RwLock<PrismConfig>,
-    backends: BackendManager,
+    pub(crate) backends: BackendManager,
     credentials: Arc<dyn crate::credentials::CredentialStore>,
     approval: ApprovalRegistry,
     audit: AuditLog,
     pub(crate) mcp_traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
+    pub(crate) mcp_servers_traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
     pub(crate) events: EventSender,
     shutdown: CancellationToken,
     listener: Listener,
@@ -263,11 +264,18 @@ impl Gateway {
         .map_err(|_| Error::Gateway("credential migration could not complete".into()))??;
         let listen_port = config.listen_port;
         let listen_address = config.listen_address;
-        let backends = BackendManager::new(events.clone(), credentials.clone());
-        let shutdown = CancellationToken::new();
-
         let mcp_traffic_path = audit_path.with_file_name("mcp.jsonl");
         let mcp_traffic = Arc::new(crate::mcp_traffic::McpTrafficLogger::new(&mcp_traffic_path)?);
+        let mcp_servers_traffic_path = audit_path.with_file_name("mcp-servers.jsonl");
+        let mcp_servers_traffic =
+            Arc::new(crate::mcp_traffic::McpTrafficLogger::new(&mcp_servers_traffic_path)?);
+        let backends = BackendManager::with_traffic(
+            events.clone(),
+            credentials.clone(),
+            mcp_servers_traffic.clone(),
+        );
+        let shutdown = CancellationToken::new();
+
         let gateway = Arc::new(Self {
             config_path,
             config: RwLock::new(config.clone()),
@@ -276,6 +284,7 @@ impl Gateway {
             approval: ApprovalRegistry::new(),
             audit,
             mcp_traffic,
+            mcp_servers_traffic,
             events,
             shutdown: shutdown.clone(),
             listener: Listener::idle(listen_port),
@@ -1015,6 +1024,10 @@ impl Gateway {
 
     pub fn mcp_traffic_path(&self) -> &Path {
         self.mcp_traffic.path()
+    }
+
+    pub fn mcp_servers_traffic_path(&self) -> &Path {
+        self.mcp_servers_traffic.path()
     }
 
     /// Compatibility cache feed. Desktop history uses `audit_query` for errors and metadata.
@@ -2581,14 +2594,23 @@ mod retained_history_tests {
         let mcp_traffic = Arc::new(
             crate::mcp_traffic::McpTrafficLogger::new(path.with_file_name("mcp.jsonl")).unwrap(),
         );
+        let mcp_servers_traffic = Arc::new(
+            crate::mcp_traffic::McpTrafficLogger::new(path.with_file_name("mcp-servers.jsonl"))
+                .unwrap(),
+        );
         Gateway {
             config_path: path.with_extension("config"),
             config: RwLock::new(PrismConfig::default()),
-            backends: BackendManager::new(events.clone(), credentials.clone()),
+            backends: BackendManager::with_traffic(
+                events.clone(),
+                credentials.clone(),
+                mcp_servers_traffic.clone(),
+            ),
             credentials,
             approval: ApprovalRegistry::new(),
             audit: AuditLog::new(path, events.clone()).unwrap(),
             mcp_traffic,
+            mcp_servers_traffic,
             events,
             shutdown: CancellationToken::new(),
             listener: Listener::idle(0),

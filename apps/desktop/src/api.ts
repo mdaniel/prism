@@ -259,3 +259,7 @@ export function openAuditLog() {
 export function openMcpLog() {
   return invoke<void>("open_mcp_log");
 }
+
+export function openMcpServersLog() {
+  return invoke<void>("open_mcp_servers_log");
+}

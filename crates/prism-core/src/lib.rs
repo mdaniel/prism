@@ -19,7 +19,7 @@ mod remote;
 mod shell_path;
 mod storage;
 
-pub use mcp_traffic::{McpTrafficLogger, McpTransaction};
+pub use mcp_traffic::{McpTrafficLogger, McpTransaction, ServerLoggingTransport};
 
 pub use approval::{
     ApprovalRegistry, Decision, DecisionScope, DecisionTarget, DecisionVerdict, HoldOutcome,

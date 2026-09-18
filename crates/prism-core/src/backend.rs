@@ -97,17 +97,32 @@ pub struct BackendManager {
     backends: Arc<RwLock<Catalog>>,
     events: EventSender,
     credentials: Arc<dyn crate::credentials::CredentialStore>,
+    traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
 }
 
 impl BackendManager {
+    #[allow(dead_code)]
     pub(crate) fn new(
         events: EventSender,
         credentials: Arc<dyn crate::credentials::CredentialStore>,
+    ) -> Self {
+        Self::with_traffic(
+            events,
+            credentials,
+            Arc::new(crate::mcp_traffic::McpTrafficLogger::ephemeral()),
+        )
+    }
+
+    pub(crate) fn with_traffic(
+        events: EventSender,
+        credentials: Arc<dyn crate::credentials::CredentialStore>,
+        traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
     ) -> Self {
         Self {
             backends: Arc::new(RwLock::new(Catalog::default())),
             events,
             credentials,
+            traffic,
         }
     }
 
@@ -143,7 +158,7 @@ impl BackendManager {
         let connected = tokio::select! {
             biased;
             _ = stop.cancelled() => return,
-            result = connect(&config, self.credentials.clone()) => result,
+            result = connect(&config, self.credentials.clone(), self.traffic.clone()) => result,
         };
         let mut catalog = self.backends.write().await;
         let Some(backend) = catalog
@@ -534,6 +549,7 @@ async fn watch_tools(
 async fn connect(
     config: &ServerConfig,
     store: Arc<dyn crate::credentials::CredentialStore>,
+    traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
 ) -> Result<(McpClient, Vec<Tool>)> {
     let protected = config.clone();
     let blocking_store = store.clone();
@@ -543,14 +559,13 @@ async fn connect(
     .await
     .map_err(|_| Error::Backend("could not retrieve server credentials".into()))??;
     let client = if config.is_remote() {
-        crate::remote::connect(config, &launch, store).await?
+        crate::remote::connect(config, &launch, store, traffic.clone()).await?
     } else {
         let mut command = server_command(config, &launch, std::env::vars_os());
         command.kill_on_drop(true);
         // Set this on the transport builder: its defaults override Command stdio settings.
-        // Servers can print credentials to stderr. Do not forward it to application logs.
-        let (transport, _) = TokioChildProcess::builder(command)
-            .stderr(std::process::Stdio::null())
+        let (transport, stderr_opt) = TokioChildProcess::builder(command)
+            .stderr(std::process::Stdio::piped())
             .spawn()
             .map_err(|err| {
                 Error::Backend(format!(
@@ -558,12 +573,87 @@ async fn connect(
                     err.kind()
                 ))
             })?;
-        tokio::time::timeout(REFRESH_TIMEOUT, Upstream::default().serve(transport))
-            .await
-            .map_err(|_| Error::Backend("server handshake timed out".into()))?
-            .map_err(|_| {
-                Error::Backend("server handshake failed; check its launch settings".into())
-            })?
+
+        let stderr_lines = Arc::new(std::sync::Mutex::new(Vec::new()));
+        if let Some(err_reader) = stderr_opt {
+            let buffer = stderr_lines.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncBufReadExt;
+                let reader = tokio::io::BufReader::new(err_reader);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut b = buffer.lock().unwrap();
+                    if b.len() < 50 {
+                        b.push(line);
+                    }
+                }
+            });
+        }
+
+        let logged_transport =
+            crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic.clone());
+        let serve_res =
+            tokio::time::timeout(REFRESH_TIMEOUT, Upstream::default().serve(logged_transport)).await;
+
+        match serve_res {
+            Ok(Ok(client)) => client,
+            Ok(Err(err)) => {
+                let stderr_summary = {
+                    let b = stderr_lines.lock().unwrap();
+                    if b.is_empty() {
+                        None
+                    } else {
+                        Some(b.join("\n"))
+                    }
+                };
+                let msg = match stderr_summary {
+                    Some(stderr) => format!("server handshake failed: {err}; stderr:\n{stderr}"),
+                    None => format!("server handshake failed: {err}"),
+                };
+                traffic.record(crate::mcp_traffic::McpTransaction {
+                    timestamp: chrono::Utc::now(),
+                    kind: "handshake_failed".into(),
+                    agent_id: config.id.clone(),
+                    agent_name: config.name.clone(),
+                    session_id: None,
+                    id: None,
+                    method: "handshake".into(),
+                    request: None,
+                    response: None,
+                    duration_ms: None,
+                    error: Some(msg.clone()),
+                });
+                return Err(Error::Backend(msg));
+            }
+            Err(_) => {
+                let stderr_summary = {
+                    let b = stderr_lines.lock().unwrap();
+                    if b.is_empty() {
+                        None
+                    } else {
+                        Some(b.join("\n"))
+                    }
+                };
+                let msg = match stderr_summary {
+                    Some(stderr) => format!("server handshake timed out; stderr:\n{stderr}"),
+                    None => "server handshake timed out".to_string(),
+                };
+                traffic.record(crate::mcp_traffic::McpTransaction {
+                    timestamp: chrono::Utc::now(),
+                    kind: "handshake_failed".into(),
+                    agent_id: config.id.clone(),
+                    agent_name: config.name.clone(),
+                    session_id: None,
+                    id: None,
+                    method: "handshake".into(),
+                    request: None,
+                    response: None,
+                    duration_ms: None,
+                    error: Some(msg.clone()),
+                });
+                return Err(Error::Backend(msg));
+            }
+        }
     };
     let tools = list_peer_tools(client.peer()).await?;
     Ok((client, tools))
@@ -754,7 +844,11 @@ mod tests {
             .expect("test server configured");
         let (mut client, tools) = tokio::time::timeout(
             Duration::from_secs(60),
-            connect(server, Arc::new(crate::credentials::NativeStore::default())),
+            connect(
+                server,
+                Arc::new(crate::credentials::NativeStore::default()),
+                Arc::new(crate::mcp_traffic::McpTrafficLogger::ephemeral()),
+            ),
         )
         .await
         .expect("server startup timed out")
@@ -938,4 +1032,70 @@ for line in sys.stdin:
         assert!(!view.contains("environment-secret"));
         manager.remove("fixture").await;
     }
+
+    #[tokio::test]
+    async fn stdio_server_handshake_failure_captures_stderr_and_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prism.json");
+        crate::PrismConfig {
+            listen_port: 0,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+        let gateway = crate::Gateway::start_with_credentials(
+            path,
+            dir.path().join("audit.jsonl"),
+            Arc::new(MemoryStore::default()),
+        )
+        .await
+        .unwrap();
+        let script = r#"
+import sys
+sys.stderr.write("FATAL_TEST_ERROR: initialization failed missing db connection\n")
+sys.exit(1)
+"#;
+        let server = gateway
+            .add_server(ServerConfig {
+                id: "broken-server".into(),
+                name: "broken-server".into(),
+                command: "python3".into(),
+                args: vec!["-u".into(), "-c".into(), script.into()],
+                env: Default::default(),
+                enabled: true,
+                credential_ref: None,
+                url: None,
+                auth: crate::config::HttpAuth::None,
+                headers: Default::default(),
+                oauth_ref: None,
+                hidden_tools: Default::default(),
+            })
+            .await
+            .unwrap();
+
+        let snapshot = gateway.backends.snapshot().await;
+        let entry = snapshot
+            .iter()
+            .find(|(s, _)| s.id == server.id)
+            .expect("found server");
+        match &entry.1 {
+            BackendStatus::Failed { error } => {
+                assert!(
+                    error.contains("FATAL_TEST_ERROR"),
+                    "expected FATAL_TEST_ERROR in stderr, error was: {error}"
+                );
+                assert!(
+                    error.contains("initialization failed missing db connection"),
+                    "expected full message in stderr, error was: {error}"
+                );
+            }
+            other => panic!("expected failed status, got: {other:?}"),
+        }
+
+        let servers_log_path = gateway.mcp_servers_traffic_path();
+        let content = std::fs::read_to_string(servers_log_path).unwrap();
+        assert!(content.contains("handshake_failed"));
+        assert!(content.contains("FATAL_TEST_ERROR"));
+    }
 }
+

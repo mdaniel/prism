@@ -80,6 +80,10 @@ function ActivityPage({ filter }: { filter: ActivityFilter }) {
     try { await api.openMcpLog(); }
     catch (e) { errorMessage.value = describeError(e); }
   };
+  const openMcpServersLog = async () => {
+    try { await api.openMcpServersLog(); }
+    catch (e) { errorMessage.value = describeError(e); }
+  };
   const narrow = (patch: Partial<ActivityFilter>) => replace({ kind: "activity", ...filter, ...patch });
   const refresh = () => narrow({at: new Date().toISOString()});
   const agentName = filter.agentId ? (agents.value.find(a => a.id === filter.agentId)?.name ?? hostName(filter.agentId)) : null;
@@ -93,6 +97,7 @@ function ActivityPage({ filter }: { filter: ActivityFilter }) {
     <>
       <Button variant="quiet" onClick={() => void openLog()}>Open log</Button>
       <Button variant="quiet" onClick={() => void openMcpLog()}>Open MCP traffic</Button>
+      <Button variant="quiet" onClick={() => void openMcpServersLog()}>Open servers traffic</Button>
       <Button busy={busy} disabled={!page || page.total === 0} onClick={() => void exportRows()}>Export</Button>
     </>
   }>

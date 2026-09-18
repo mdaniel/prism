@@ -50,11 +50,21 @@ impl McpTrafficLogger {
         })
     }
 
+    pub fn ephemeral() -> Self {
+        Self {
+            path: PathBuf::new(),
+            writer: Arc::new(Mutex::new(None)),
+        }
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
 
     pub fn record(&self, transaction: McpTransaction) {
+        if self.path.as_os_str().is_empty() {
+            return;
+        }
         let line = match serde_json::to_string(&transaction) {
             Ok(line) => line,
             Err(err) => {
@@ -79,6 +89,98 @@ impl McpTrafficLogger {
                 tracing::error!(%err, "failed to write mcp traffic log");
             }
         }
+    }
+}
+
+use rmcp::service::{RxJsonRpcMessage, TxJsonRpcMessage};
+use rmcp::transport::Transport;
+use rmcp::RoleClient;
+
+pub struct ServerLoggingTransport<T> {
+    inner: T,
+    server_id: String,
+    traffic: Arc<McpTrafficLogger>,
+}
+
+impl<T: Transport<RoleClient>> ServerLoggingTransport<T> {
+    pub fn new(inner: T, server_id: String, traffic: Arc<McpTrafficLogger>) -> Self {
+        Self {
+            inner,
+            server_id,
+            traffic,
+        }
+    }
+}
+
+impl<T: Transport<RoleClient>> Transport<RoleClient> for ServerLoggingTransport<T> {
+    type Error = T::Error;
+
+    fn name() -> std::borrow::Cow<'static, str> {
+        T::name()
+    }
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleClient>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let payload = serde_json::to_value(&item).ok();
+        let method = payload
+            .as_ref()
+            .and_then(|p| p.get("method").and_then(|m| m.as_str()))
+            .unwrap_or("response")
+            .to_string();
+        let id = payload.as_ref().and_then(|p| p.get("id").cloned());
+        let traffic = self.traffic.clone();
+        let server_id = self.server_id.clone();
+        let send_fut = self.inner.send(item);
+        async move {
+            let res = send_fut.await;
+            traffic.record(McpTransaction {
+                timestamp: Utc::now(),
+                kind: "upstream_send".into(),
+                agent_id: server_id.clone(),
+                agent_name: server_id,
+                session_id: None,
+                id,
+                method,
+                request: payload,
+                response: None,
+                duration_ms: None,
+                error: res.as_ref().err().map(|e| e.to_string()),
+            });
+            res
+        }
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleClient>> {
+        let item = self.inner.receive().await;
+        if let Some(ref msg) = item {
+            let payload = serde_json::to_value(msg).ok();
+            let method = payload
+                .as_ref()
+                .and_then(|p| p.get("method").and_then(|m| m.as_str()))
+                .unwrap_or("response")
+                .to_string();
+            let id = payload.as_ref().and_then(|p| p.get("id").cloned());
+            self.traffic.record(McpTransaction {
+                timestamp: Utc::now(),
+                kind: "upstream_receive".into(),
+                agent_id: self.server_id.clone(),
+                agent_name: self.server_id.clone(),
+                session_id: None,
+                id,
+                method,
+                request: None,
+                response: payload,
+                duration_ms: None,
+                error: None,
+            });
+        }
+        item
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
     }
 }
 

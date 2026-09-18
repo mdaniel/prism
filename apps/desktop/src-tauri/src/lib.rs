@@ -1201,6 +1201,20 @@ fn open_mcp_log(app: AppHandle) -> Result<(), String> {
         .map_err(|_| "Could not open the MCP traffic log".to_string())
 }
 
+/// Open the raw upstream MCP server JSON-RPC traffic log.
+#[tauri::command]
+fn open_mcp_servers_log(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let (_, audit_path) = config_paths(&app)?;
+    let mcp_path = audit_path.with_file_name("mcp-servers.jsonl");
+    if !mcp_path.exists() {
+        return Err("No upstream MCP servers traffic log yet".to_string());
+    }
+    app.opener()
+        .open_path(mcp_path.display().to_string(), None::<&str>)
+        .map_err(|_| "Could not open the MCP servers traffic log".to_string())
+}
+
 fn config_paths(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
     let config_dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
     let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
@@ -1717,6 +1731,7 @@ pub fn run() {
             open_export,
             open_audit_log,
             open_mcp_log,
+            open_mcp_servers_log,
         ]);
 
     let app = match builder.build(tauri::generate_context!()) {

@@ -132,7 +132,7 @@ where
             if text.contains("401") || text.contains("Unauthorized") || text.contains("auth") {
                 Error::SignInRequired
             } else {
-                Error::Backend("server handshake failed; check the URL and its sign-in".into())
+                Error::Backend(format!("server handshake failed: {err}; check the URL and its sign-in"))
             }
         })
 }
@@ -142,6 +142,7 @@ pub(crate) async fn connect(
     config: &ServerConfig,
     launch: &LaunchSettings,
     store: Arc<dyn CredentialStore>,
+    traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
 ) -> Result<McpClient> {
     let url = config
         .url
@@ -152,13 +153,15 @@ pub(crate) async fn connect(
         HttpAuth::None | HttpAuth::Header => {
             let transport =
                 StreamableHttpClientTransport::with_client(http_client()?, transport_config);
-            handshake(Upstream::default().serve_with_lifecycle(transport, remote_lifecycle())).await
+            let logged = crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic);
+            handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
         }
         HttpAuth::Oauth => {
             let manager = authorized_manager(config, store).await?;
             let client = AuthClient::new(http_client()?, manager);
             let transport = StreamableHttpClientTransport::with_client(client, transport_config);
-            handshake(Upstream::default().serve_with_lifecycle(transport, remote_lifecycle())).await
+            let logged = crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic);
+            handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
         }
     }
 }
