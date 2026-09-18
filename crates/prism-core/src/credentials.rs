@@ -1,6 +1,7 @@
 //! Server launch values live in the OS credential store, never in saved JSON.
-use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +24,7 @@ pub(crate) trait CredentialStore: Send + Sync {
 pub(crate) struct NativeStore(Mutex<()>);
 
 fn unavailable() -> Error {
-    Error::Gateway("OS credential storage is locked, unavailable, or missing an entry. Unlock your keychain/credential store and retry; Prism does not fall back to plaintext.".into())
+    Error::Gateway("credential storage is locked, unavailable, or missing an entry. Unlock your credential store or re-save server settings.".into())
 }
 
 impl CredentialStore for NativeStore {
@@ -46,6 +47,100 @@ impl CredentialStore for NativeStore {
         match keyring::Entry::new(SERVICE, key).and_then(|entry| entry.delete_credential()) {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(_) => Err(unavailable()),
+        }
+    }
+}
+
+/// A static file-backed credential store (`credentials.json`) that avoids OS keychain prompts.
+pub(crate) struct FileStore {
+    path: PathBuf,
+    entries: RwLock<HashMap<String, Vec<u8>>>,
+}
+
+impl FileStore {
+    pub(crate) fn new(path: PathBuf) -> Result<Self> {
+        let mut entries = HashMap::new();
+        if path.exists() {
+            let data = std::fs::read(&path)
+                .map_err(|e| Error::Gateway(format!("could not read credentials file: {e}")))?;
+            if !data.is_empty() {
+                let raw_map: BTreeMap<String, String> = serde_json::from_slice(&data)
+                    .map_err(|e| Error::Gateway(format!("invalid credentials file JSON: {e}")))?;
+                use base64::engine::general_purpose::STANDARD as BASE64;
+                use base64::Engine;
+                for (k, v) in raw_map {
+                    let bytes = match BASE64.decode(&v) {
+                        Ok(b) => b,
+                        Err(_) => v.into_bytes(),
+                    };
+                    entries.insert(k, bytes);
+                }
+            }
+        }
+        Ok(Self {
+            path,
+            entries: RwLock::new(entries),
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn persist(&self) -> Result<()> {
+        let entries = self.entries.read().map_err(|_| unavailable())?;
+        use base64::engine::general_purpose::STANDARD as BASE64;
+        use base64::Engine;
+        let mut raw_map = BTreeMap::new();
+        for (k, v) in entries.iter() {
+            raw_map.insert(k.clone(), BASE64.encode(v));
+        }
+        let json = serde_json::to_string_pretty(&raw_map)
+            .map_err(|e| Error::Gateway(format!("could not serialize credentials: {e}")))?;
+        crate::storage::atomic_write(&self.path, json.as_bytes())
+            .map_err(|e| Error::Gateway(format!("could not save credentials: {e}")))?;
+        Ok(())
+    }
+}
+
+impl CredentialStore for FileStore {
+    fn set(&self, key: &str, value: &[u8]) -> Result<()> {
+        {
+            let mut entries = self.entries.write().map_err(|_| unavailable())?;
+            entries.insert(key.to_string(), value.to_vec());
+        }
+        self.persist()
+    }
+
+    fn get(&self, key: &str) -> Result<Vec<u8>> {
+        let entries = self.entries.read().map_err(|_| unavailable())?;
+        entries.get(key).cloned().ok_or_else(unavailable)
+    }
+
+    fn delete(&self, key: &str) -> Result<()> {
+        let removed = {
+            let mut entries = self.entries.write().map_err(|_| unavailable())?;
+            entries.remove(key).is_some()
+        };
+        if removed {
+            self.persist()?;
+        }
+        Ok(())
+    }
+}
+
+/// Create the default credential store. Defaults to `FileStore` (`credentials.json`),
+/// unless `PRISM_CREDENTIAL_STORE` is explicitly set to `native` or `keychain`.
+pub(crate) fn default_store(config_path: &Path) -> Result<Arc<dyn CredentialStore>> {
+    let provider = std::env::var("PRISM_CREDENTIAL_STORE").unwrap_or_else(|_| "file".into());
+    match provider.to_lowercase().as_str() {
+        "native" | "keychain" | "os" => Ok(Arc::new(NativeStore::default())),
+        _ => {
+            let cred_path = std::env::var("PRISM_CREDENTIALS_PATH")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| config_path.with_file_name("credentials.json"));
+            Ok(Arc::new(FileStore::new(cred_path)?))
         }
     }
 }
@@ -433,4 +528,79 @@ pub(crate) mod tests {
         removed.unwrap();
         assert!(resolve(&store, &server).is_err());
     }
+
+    #[test]
+    fn file_store_round_trip_and_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let cred_path = dir.path().join("credentials.json");
+
+        // Write with first store instance
+        {
+            let store = FileStore::new(cred_path.clone()).unwrap();
+            let mut server = server();
+            let expected_args = server.args.clone();
+            let expected_env = server.env.clone();
+            protect_server(&store, &mut server).unwrap();
+            assert!(server.credential_ref.is_some());
+            let resolved = resolve(&store, &server).unwrap();
+            assert_eq!(resolved.args, expected_args);
+            assert_eq!(resolved.env, expected_env);
+            assert!(cred_path.exists());
+        }
+
+        // Re-read with a new store instance (persistence check)
+        {
+            let store = FileStore::new(cred_path.clone()).unwrap();
+            let mut server = server();
+            // Assign the credential_ref from disk
+            let disk_content = std::fs::read_to_string(&cred_path).unwrap();
+            assert!(!disk_content.is_empty());
+            // Lookup key from entries
+            let id = store
+                .entries
+                .read()
+                .unwrap()
+                .keys()
+                .find(|k| !k.contains('/'))
+                .cloned()
+                .unwrap();
+            server.args.clear();
+            server.env.clear();
+            server.credential_ref = Some(id.clone());
+            let resolved = resolve(&store, &server).unwrap();
+            assert_eq!(resolved.args, vec!["--token=argument-secret"]);
+            assert_eq!(
+                resolved.env.get("CUSTOM_VALUE").unwrap(),
+                &"env-secret".repeat(1000)
+            );
+
+            // Delete
+            delete(&store, &id).unwrap();
+            assert!(resolve(&store, &server).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_starts_with_default_file_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prism.json");
+        PrismConfig {
+            listen_port: 0,
+            ..Default::default()
+        }
+        .save(&path)
+        .unwrap();
+
+        // Gateway::start should create credentials.json next to prism.json
+        let gateway = crate::Gateway::start(&path, dir.path().join("audit.jsonl"))
+            .await
+            .unwrap();
+        let cred_path = path.with_file_name("credentials.json");
+
+        let added = gateway.add_server(server()).await.unwrap();
+        assert!(added.credential_ref.is_some());
+        assert!(cred_path.exists());
+        gateway.shutdown().await;
+    }
 }
+

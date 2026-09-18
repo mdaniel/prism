@@ -210,10 +210,11 @@ impl Gateway {
         config_path: impl AsRef<Path>,
         audit_path: impl AsRef<Path>,
     ) -> Result<Arc<Self>> {
+        let store = crate::credentials::default_store(config_path.as_ref())?;
         Self::start_with_credentials(
             config_path.as_ref().to_path_buf(),
             audit_path.as_ref().to_path_buf(),
-            Arc::new(crate::credentials::NativeStore::default()),
+            store,
         )
         .await
     }
@@ -2590,7 +2591,7 @@ mod retained_history_tests {
 
     pub(super) fn gateway(path: &Path) -> Gateway {
         let (events, _) = channel();
-        let credentials = Arc::new(crate::credentials::NativeStore::default());
+        let credentials = Arc::new(crate::credentials::tests::MemoryStore::default());
         let mcp_traffic = Arc::new(
             crate::mcp_traffic::McpTrafficLogger::new(path.with_file_name("mcp.jsonl")).unwrap(),
         );
