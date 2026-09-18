@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,11 +19,9 @@ use crate::events::{EventSender, GatewayEvent};
 // Busy installations can therefore retain substantially less than 30 days.
 pub const MAX_QUERY_LIMIT: usize = 5000;
 const MAX_PENDING_RECORDS: usize = 256;
-const MAX_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const ARCHIVES: usize = 3;
 const RETENTION_DAYS: i64 = 30;
-const MAX_RECORD_BYTES: usize = 32 * 1024;
-const REDACTED_ERROR: &str = "Error details omitted to protect credentials";
+pub const REDACTED_ERROR: &str = "Error details omitted to protect credentials";
 
 /// How a call was resolved.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -187,10 +185,10 @@ impl AuditWindow {
             newest_available_at: None,
             retention_days: RETENTION_DAYS as u32,
             archive_count: ARCHIVES,
-            max_file_bytes: MAX_FILE_BYTES,
-            max_history_bytes: MAX_FILE_BYTES * (ARCHIVES as u64 + 1),
+            max_file_bytes: u64::MAX,
+            max_history_bytes: u64::MAX,
             retained_bytes: 0,
-            size_limited: true,
+            size_limited: false,
             full_window_guaranteed: false,
         }
     }
@@ -349,10 +347,8 @@ fn file_stamp(path: &Path) -> std::io::Result<Option<FileStamp>> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(err),
     };
-    if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
-        return Err(history_error(
-            "audit history is not a regular file within its size limit",
-        ));
+    if !metadata.is_file() {
+        return Err(history_error("audit history is not a regular file"));
     }
     Ok(Some(FileStamp {
         bytes: metadata.len(),
@@ -373,21 +369,18 @@ impl HistoryCache {
             let stamp = file_stamp(&path)?;
             let mut entries = Vec::new();
             if let Some(stamp) = &stamp {
-                let mut reader =
-                    BufReader::new(crate::storage::read(&path)?.take(MAX_FILE_BYTES + 1));
+                let mut reader = BufReader::new(crate::storage::read(&path)?);
                 let mut bytes = 0;
                 loop {
                     let mut line = Vec::new();
-                    let read = (&mut reader)
-                        .take(MAX_RECORD_BYTES as u64 + 1)
-                        .read_until(b'\n', &mut line)?;
+                    let read = (&mut reader).read_until(b'\n', &mut line)?;
                     if read == 0 {
                         break;
                     }
                     bytes += read as u64;
-                    if line.len() > MAX_RECORD_BYTES || line.last() != Some(&b'\n') {
+                    if line.last() != Some(&b'\n') {
                         return Err(history_error(
-                            "audit history contains an oversized or incomplete record",
+                            "audit history contains an incomplete record",
                         ));
                     }
                     let mut entry: AuditEntry = serde_json::from_slice(&line).map_err(|_| {
@@ -507,29 +500,19 @@ fn sanitize(entry: &mut AuditEntry) {
     }
 }
 
-/// Also rewrites legacy logs so old error payloads do not remain in archives.
-fn retain_file(path: &Path, now: DateTime<Utc>, max_bytes: u64) -> std::io::Result<()> {
+fn retain_file(path: &Path, now: DateTime<Utc>) -> std::io::Result<()> {
     if !path.try_exists()? {
         return Ok(());
     }
     let file = crate::storage::read(path)?;
-    if file.metadata()?.len() > MAX_FILE_BYTES {
-        return Err(history_error("audit file exceeds its size limit"));
-    }
-    let mut reader = BufReader::new(file.take(MAX_FILE_BYTES + 1));
+    let mut reader = BufReader::new(file);
     let cutoff = now - chrono::Duration::days(RETENTION_DAYS);
     let mut retained = VecDeque::new();
-    let mut total = 0usize;
     loop {
         let mut line = Vec::new();
-        let read = (&mut reader)
-            .take(MAX_RECORD_BYTES as u64 + 1)
-            .read_until(b'\n', &mut line)?;
+        let read = (&mut reader).read_until(b'\n', &mut line)?;
         if read == 0 {
             break;
-        }
-        if line.len() > MAX_RECORD_BYTES {
-            return Err(history_error("audit history contains an oversized record"));
         }
         let mut entry = serde_json::from_slice::<AuditEntry>(&line)
             .map_err(|_| history_error("audit history contains an unreadable record"))?;
@@ -539,17 +522,7 @@ fn retain_file(path: &Path, now: DateTime<Utc>, max_bytes: u64) -> std::io::Resu
         sanitize(&mut entry);
         let mut line = serde_json::to_vec(&entry)?;
         line.push(b'\n');
-        if line.len() as u64 > max_bytes {
-            continue;
-        }
-        total += line.len();
         retained.push_back(line);
-        while total as u64 > max_bytes {
-            total -= retained
-                .pop_front()
-                .expect("nonempty retained entries")
-                .len();
-        }
     }
     drop(reader);
     crate::storage::atomic_write(path, &retained.into_iter().flatten().collect::<Vec<_>>())
@@ -563,7 +536,7 @@ fn maintain(path: &Path) -> std::io::Result<()> {
         } else {
             archive(path, index)
         };
-        retain_file(&file, now, MAX_FILE_BYTES)?;
+        retain_file(&file, now)?;
         if index != 0 && file.try_exists()? && fs::metadata(&file)?.len() == 0 {
             fs::remove_file(file)?;
         }
@@ -571,6 +544,7 @@ fn maintain(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 fn rotate(path: &Path) -> std::io::Result<()> {
     for index in (1..=ARCHIVES).rev() {
         let target = archive(path, index);
@@ -731,9 +705,6 @@ impl AuditLog {
                     writer.file.take();
                 }
                 let line = serde_json::to_string(&entry)?;
-                if line.len() >= MAX_RECORD_BYTES {
-                    return Err(history_error("audit entry exceeds size limit"));
-                }
                 self.append_line(&mut writer, &line)?;
                 writer.history.segments[0].push(Arc::new(entry.clone()));
                 writer.history.stamps[0] = file_stamp(&self.path)?;
@@ -762,18 +733,6 @@ impl AuditLog {
             let file = crate::storage::append(&self.path)?;
             writer.bytes = file.metadata()?.len();
             writer.file = Some(file);
-        }
-        if writer.bytes + line.len() as u64 + 1 > MAX_FILE_BYTES {
-            writer.file.take();
-            rotate(&self.path)?;
-            writer.file = Some(crate::storage::append(&self.path)?);
-            writer.bytes = 0;
-            writer.history.segments.insert(0, Vec::new());
-            writer.history.segments.truncate(ARCHIVES + 1);
-            writer.history.stamps = history_paths(&self.path)
-                .map(|p| file_stamp(&p))
-                .collect::<std::io::Result<_>>()?;
-            writer.history.sorted = None;
         }
         writeln!(writer.file.as_mut().expect("opened audit log"), "{line}")?;
         writer.bytes += line.len() as u64 + 1;
@@ -1020,16 +979,11 @@ mod tests {
             ..Default::default()
         };
         let before = audit.query(query.clone()).await.unwrap();
-        assert!(before.total > 5000, "total {}", before.total);
-        assert!(
-            before.total < 18000,
-            "the size limit must evict oldest history"
-        );
+        assert_eq!(before.total, 18000);
         assert_eq!(before.entries[0].id, "row-17999");
         assert!(before.has_more);
-        assert_eq!(before.window.max_history_bytes, 20 * 1024 * 1024);
-        assert!(before.window.retained_bytes <= before.window.max_history_bytes);
-        assert!(before.window.size_limited);
+        assert_eq!(before.window.max_history_bytes, u64::MAX);
+        assert!(!before.window.size_limited);
         assert!(!before.window.full_window_guaranteed);
         let all = audit.export(query.clone()).await.unwrap();
         assert_eq!(all.total, before.total);
@@ -1084,9 +1038,6 @@ mod tests {
                 .jsonl,
             all.jsonl
         );
-        for path in history_paths(&path) {
-            assert!(fs::metadata(path).unwrap().len() <= MAX_FILE_BYTES);
-        }
         assert!(!archive(&path, ARCHIVES + 1).exists());
     }
 

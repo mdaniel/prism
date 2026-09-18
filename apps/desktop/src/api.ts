@@ -255,3 +255,7 @@ export function openExport(path: string) {
 export function openAuditLog() {
   return invoke<void>("open_audit_log");
 }
+
+export function openMcpLog() {
+  return invoke<void>("open_mcp_log");
+}

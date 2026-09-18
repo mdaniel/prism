@@ -12,11 +12,14 @@ mod gateway;
 mod http_security;
 mod listener;
 pub mod native;
+pub mod mcp_traffic;
 mod oauth;
 pub mod policy;
 mod remote;
 mod shell_path;
 mod storage;
+
+pub use mcp_traffic::{McpTrafficLogger, McpTransaction};
 
 pub use approval::{
     ApprovalRegistry, Decision, DecisionScope, DecisionTarget, DecisionVerdict, HoldOutcome,

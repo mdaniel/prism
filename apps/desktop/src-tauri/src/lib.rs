@@ -21,7 +21,7 @@ use tauri::{
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use tauri_plugin_notification::NotificationExt;
 use tauri_plugin_updater::UpdaterExt;
-use tracing::{debug, error, warn};
+use tracing::{error, warn};
 
 const TRAY_ID: &str = "prism-tray";
 const PANEL_LABEL: &str = "panel";
@@ -1187,6 +1187,20 @@ fn open_audit_log(app: AppHandle) -> Result<(), String> {
         .map_err(|_| "Could not open the log".to_string())
 }
 
+/// Open the raw MCP JSON-RPC traffic log.
+#[tauri::command]
+fn open_mcp_log(app: AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let (_, audit_path) = config_paths(&app)?;
+    let mcp_path = audit_path.with_file_name("mcp.jsonl");
+    if !mcp_path.exists() {
+        return Err("No MCP traffic log yet".to_string());
+    }
+    app.opener()
+        .open_path(mcp_path.display().to_string(), None::<&str>)
+        .map_err(|_| "Could not open the MCP traffic log".to_string())
+}
+
 fn config_paths(app: &AppHandle) -> Result<(PathBuf, PathBuf), String> {
     let config_dir = app.path().app_config_dir().map_err(|err| err.to_string())?;
     let data_dir = app.path().app_data_dir().map_err(|err| err.to_string())?;
@@ -1702,6 +1716,7 @@ pub fn run() {
             export_audit,
             open_export,
             open_audit_log,
+            open_mcp_log,
         ]);
 
     let app = match builder.build(tauri::generate_context!()) {

@@ -186,6 +186,7 @@ pub struct Gateway {
     credentials: Arc<dyn crate::credentials::CredentialStore>,
     approval: ApprovalRegistry,
     audit: AuditLog,
+    pub(crate) mcp_traffic: Arc<crate::mcp_traffic::McpTrafficLogger>,
     pub(crate) events: EventSender,
     shutdown: CancellationToken,
     listener: Listener,
@@ -238,8 +239,9 @@ impl Gateway {
             .map(|dir| dir.join("hook-token"))
             .unwrap_or_else(|| PathBuf::from("hook-token"));
         let token_path = hook_token_path.clone();
+        let audit_path_clone = audit_path.clone();
         let (audit, hook_token) = tokio::task::spawn_blocking(move || {
-            let audit = AuditLog::new(audit_path, audit_events)?;
+            let audit = AuditLog::new(audit_path_clone, audit_events)?;
             let token = load_or_create_hook_token(&token_path)?;
             Ok::<_, Error>((audit, token))
         })
@@ -264,6 +266,8 @@ impl Gateway {
         let backends = BackendManager::new(events.clone(), credentials.clone());
         let shutdown = CancellationToken::new();
 
+        let mcp_traffic_path = audit_path.with_file_name("mcp.jsonl");
+        let mcp_traffic = Arc::new(crate::mcp_traffic::McpTrafficLogger::new(&mcp_traffic_path)?);
         let gateway = Arc::new(Self {
             config_path,
             config: RwLock::new(config.clone()),
@@ -271,6 +275,7 @@ impl Gateway {
             credentials,
             approval: ApprovalRegistry::new(),
             audit,
+            mcp_traffic,
             events,
             shutdown: shutdown.clone(),
             listener: Listener::idle(listen_port),
@@ -782,7 +787,7 @@ impl Gateway {
         }
     }
 
-    async fn agent_by_id(&self, agent_id: &str) -> Option<AgentConfig> {
+    pub(crate) async fn agent_by_id(&self, agent_id: &str) -> Option<AgentConfig> {
         self.config
             .read()
             .await
@@ -1006,6 +1011,10 @@ impl Gateway {
         }
         let _ = self.events.send(GatewayEvent::RulesChanged);
         Ok(())
+    }
+
+    pub fn mcp_traffic_path(&self) -> &Path {
+        self.mcp_traffic.path()
     }
 
     /// Compatibility cache feed. Desktop history uses `audit_query` for errors and metadata.
@@ -2027,11 +2036,28 @@ impl ServerHandler for PrismProxy {
             {
                 break;
             }
-            if changed
-                && context.accepted().tools_list_changed == Some(true)
-                && context.sink().notify_tool_list_changed().await.is_err()
-            {
-                break;
+            if changed && context.accepted().tools_list_changed == Some(true) {
+                if context.sink().notify_tool_list_changed().await.is_err() {
+                    break;
+                }
+                self.gateway.mcp_traffic.record(crate::mcp_traffic::McpTransaction {
+                    timestamp: Utc::now(),
+                    kind: "notification".into(),
+                    agent_id: identity.agent_id.clone(),
+                    agent_name: self
+                        .gateway
+                        .agent_by_id(&identity.agent_id)
+                        .await
+                        .map(|a| a.name)
+                        .unwrap_or_else(|| identity.agent_id.clone()),
+                    session_id: Some(self.session_id.clone()),
+                    id: None,
+                    method: "notifications/tools/list_changed".into(),
+                    request: None,
+                    response: None,
+                    duration_ms: None,
+                    error: None,
+                });
             }
         }
         Ok(())
@@ -2056,49 +2082,114 @@ impl ServerHandler for PrismProxy {
         request: InitializeRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<InitializeResult, McpError> {
+        let started = std::time::Instant::now();
         let authenticated = context
             .extensions
             .get::<http::request::Parts>()
             .and_then(|parts| parts.extensions.get::<AuthenticatedAgent>())
             .map(|a| a.agent_id.clone());
         let version = Some(request.client_info.version.as_str());
-        let authenticated = authenticated
-            .ok_or_else(|| McpError::invalid_request("a bearer token is required", None))?;
-        let agent_id = self
-            .gateway
-            .register_authenticated_presence(
-                &self.session_id,
-                &authenticated,
-                version,
-                Some(context.peer.clone()),
-            )
-            .await
-            .map(|a| a.id)
-            .ok_or_else(|| McpError::invalid_request("unknown agent", None))?;
-        if let Ok(mut slot) = self.agent_id.lock() {
-            *slot = Some(agent_id);
-        }
-        Ok(self.get_info())
+        let res = match authenticated {
+            Some(ref auth) => {
+                match self
+                    .gateway
+                    .register_authenticated_presence(
+                        &self.session_id,
+                        auth,
+                        version,
+                        Some(context.peer.clone()),
+                    )
+                    .await
+                {
+                    Some(agent) => {
+                        if let Ok(mut slot) = self.agent_id.lock() {
+                            *slot = Some(agent.id.clone());
+                        }
+                        Ok((agent.id, agent.name, self.get_info()))
+                    }
+                    None => Err(McpError::invalid_request("unknown agent", None)),
+                }
+            }
+            None => Err(McpError::invalid_request("a bearer token is required", None)),
+        };
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let (agent_id, agent_name, result) = match res {
+            Ok((id, name, info)) => (id, name, Ok(info)),
+            Err(err) => ("unknown".into(), "unknown".into(), Err(err)),
+        };
+
+        self.gateway.mcp_traffic.record(crate::mcp_traffic::McpTransaction {
+            timestamp: Utc::now(),
+            kind: "transaction".into(),
+            agent_id,
+            agent_name,
+            session_id: Some(self.session_id.clone()),
+            id: None,
+            method: "initialize".into(),
+            request: serde_json::to_value(&request).ok(),
+            response: result.as_ref().ok().and_then(|r| serde_json::to_value(r).ok()),
+            duration_ms: Some(duration_ms),
+            error: result.as_ref().err().map(|e| e.to_string()),
+        });
+
+        result
     }
 
     async fn list_tools(
         &self,
-        _request: Option<PaginatedRequestParams>,
+        request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<ListToolsResult, McpError> {
-        let agent = self.caller(&context).await?;
-        let mut result = self.gateway.handle_list_tools(agent.as_deref()).await;
-        if context
-            .protocol_version()
-            .is_some_and(|v| v >= ProtocolVersion::V_2026_07_28)
-        {
-            // Tool availability is authorization-dependent and may change at
-            // any time. Supply July's required cache policy without sharing it.
-            result = result
-                .with_ttl_ms(0)
-                .with_cache_scope(rmcp::model::CacheScope::Private);
-        }
-        Ok(result)
+        let started = std::time::Instant::now();
+        let agent = self.caller(&context).await;
+        let (agent_id, agent_name) = match agent.as_ref() {
+            Ok(Some(id)) => {
+                let name = self
+                    .gateway
+                    .agent_by_id(id)
+                    .await
+                    .map(|a| a.name)
+                    .unwrap_or_else(|| id.clone());
+                (id.clone(), name)
+            }
+            _ => ("unknown".to_string(), "unknown".to_string()),
+        };
+
+        let result = match agent {
+            Ok(agent) => {
+                let mut result = self.gateway.handle_list_tools(agent.as_deref()).await;
+                if context
+                    .protocol_version()
+                    .is_some_and(|v| v >= ProtocolVersion::V_2026_07_28)
+                {
+                    // Tool availability is authorization-dependent and may change at
+                    // any time. Supply July's required cache policy without sharing it.
+                    result = result
+                        .with_ttl_ms(0)
+                        .with_cache_scope(rmcp::model::CacheScope::Private);
+                }
+                Ok(result)
+            }
+            Err(err) => Err(err),
+        };
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        self.gateway.mcp_traffic.record(crate::mcp_traffic::McpTransaction {
+            timestamp: Utc::now(),
+            kind: "transaction".into(),
+            agent_id,
+            agent_name,
+            session_id: Some(self.session_id.clone()),
+            id: None,
+            method: "tools/list".into(),
+            request: request.and_then(|r| serde_json::to_value(r).ok()),
+            response: result.as_ref().ok().and_then(|r| serde_json::to_value(r).ok()),
+            duration_ms: Some(duration_ms),
+            error: result.as_ref().err().map(|e| e.to_string()),
+        });
+
+        result
     }
 
     async fn call_tool(
@@ -2106,17 +2197,58 @@ impl ServerHandler for PrismProxy {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> std::result::Result<CallToolResponse, McpError> {
-        let agent = self.caller(&context).await?;
-        tokio::select! {
-            biased;
-            _ = context.ct.cancelled() => Err(McpError::invalid_request("request cancelled", None)),
-            result = self.gateway.handle_call_tool(request, agent.as_deref()) => result.map(|mut result| {
-                // Legacy upstreams omit this field. Restore the modern envelope;
-                // rmcp strips it again when the downstream client is legacy.
-                result.result_type = Some(rmcp::model::ResultType::COMPLETE);
-                result.into()
-            }),
-        }
+        let started = std::time::Instant::now();
+        let agent = self.caller(&context).await;
+        let (agent_id, agent_name) = match agent.as_ref() {
+            Ok(Some(id)) => {
+                let name = self
+                    .gateway
+                    .agent_by_id(id)
+                    .await
+                    .map(|a| a.name)
+                    .unwrap_or_else(|| id.clone());
+                (id.clone(), name)
+            }
+            _ => ("unknown".to_string(), "unknown".to_string()),
+        };
+
+        let req_val = serde_json::to_value(&request).ok();
+        let mut resp_val = None;
+        let result = match agent {
+            Ok(agent) => {
+                tokio::select! {
+                    biased;
+                    _ = context.ct.cancelled() => Err(McpError::invalid_request("request cancelled", None)),
+                    result = self.gateway.handle_call_tool(request, agent.as_deref()) => {
+                        resp_val = result.as_ref().ok().and_then(|r| serde_json::to_value(r).ok());
+                        result.map(|mut result| {
+                            // Legacy upstreams omit this field. Restore the modern envelope;
+                            // rmcp strips it again when the downstream client is legacy.
+                            result.result_type = Some(rmcp::model::ResultType::COMPLETE);
+                            result.into()
+                        })
+                    }
+                }
+            }
+            Err(err) => Err(err),
+        };
+
+        let duration_ms = started.elapsed().as_millis() as u64;
+        self.gateway.mcp_traffic.record(crate::mcp_traffic::McpTransaction {
+            timestamp: Utc::now(),
+            kind: "transaction".into(),
+            agent_id,
+            agent_name,
+            session_id: Some(self.session_id.clone()),
+            id: None,
+            method: "tools/call".into(),
+            request: req_val,
+            response: resp_val,
+            duration_ms: Some(duration_ms),
+            error: result.as_ref().err().map(|e| e.to_string()),
+        });
+
+        result
     }
 }
 
@@ -2446,6 +2578,9 @@ mod retained_history_tests {
     pub(super) fn gateway(path: &Path) -> Gateway {
         let (events, _) = channel();
         let credentials = Arc::new(crate::credentials::NativeStore::default());
+        let mcp_traffic = Arc::new(
+            crate::mcp_traffic::McpTrafficLogger::new(path.with_file_name("mcp.jsonl")).unwrap(),
+        );
         Gateway {
             config_path: path.with_extension("config"),
             config: RwLock::new(PrismConfig::default()),
@@ -2453,6 +2588,7 @@ mod retained_history_tests {
             credentials,
             approval: ApprovalRegistry::new(),
             audit: AuditLog::new(path, events.clone()).unwrap(),
+            mcp_traffic,
             events,
             shutdown: CancellationToken::new(),
             listener: Listener::idle(0),

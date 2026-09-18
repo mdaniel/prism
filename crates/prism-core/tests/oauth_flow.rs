@@ -1942,3 +1942,63 @@ async fn browser_authorize_waits_privately_then_redirects_once() {
         gateway.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn mcp_traffic_logs_requests_and_responses() {
+    let (gateway, port, _dir) = start().await;
+    let fixture = ToolFixture::start().await;
+    gateway.add_server(fixture.config.clone()).await.unwrap();
+    let (agent, token) = signed_in_agent(&gateway, port, "traffic-agent").await;
+    gateway
+        .set_agent_policy(&agent, Some(prism_core::Posture::Trusted), None)
+        .await
+        .unwrap();
+
+    let auth_header = format!("Bearer {token}");
+    let init_headers = [
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json, text/event-stream"),
+        ("Authorization", auth_header.as_str()),
+    ];
+
+    let init = http(port, "POST", "/mcp", &init_headers, INIT).await;
+    assert_eq!(init.status, 200, "{}", init.body);
+
+    let session = &init.headers["mcp-session-id"];
+    let session_headers = [
+        ("Content-Type", "application/json"),
+        ("Accept", "application/json, text/event-stream"),
+        ("Authorization", auth_header.as_str()),
+        ("MCP-Session-Id", session.as_str()),
+        ("MCP-Protocol-Version", "2025-06-18"),
+    ];
+
+    let list = http(port, "POST", "/mcp", &session_headers, LIST_TOOLS).await;
+    assert_eq!(list.status, 200, "{}", list.body);
+
+    let call = r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fixture__ping","arguments":{}}}"#;
+    let call_resp = http(port, "POST", "/mcp", &session_headers, call).await;
+    assert_eq!(call_resp.status, 200, "{}", call_resp.body);
+
+    let mcp_path = gateway.mcp_traffic_path();
+    assert!(mcp_path.exists());
+
+    let content = std::fs::read_to_string(mcp_path).unwrap();
+    let lines: Vec<&str> = content.lines().collect();
+    assert!(lines.len() >= 3, "actual lines: {:?}", lines);
+
+    let parsed: Vec<serde_json::Value> = lines
+        .into_iter()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+
+    assert!(parsed.iter().any(|p| p["method"] == "initialize"));
+    assert!(parsed.iter().any(|p| p["method"] == "tools/list"));
+    let tool_call = parsed.iter().find(|p| p["method"] == "tools/call").expect("tool call logged");
+    assert_eq!(tool_call["method"], "tools/call");
+    assert_eq!(tool_call["request"]["name"], "fixture__ping");
+    assert!(tool_call["response"].to_string().contains("pong"), "actual tool_call: {tool_call}");
+
+    gateway.shutdown().await;
+}
+

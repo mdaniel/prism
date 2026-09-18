@@ -76,6 +76,10 @@ function ActivityPage({ filter }: { filter: ActivityFilter }) {
     try { await api.openAuditLog(); }
     catch (e) { errorMessage.value = describeError(e); }
   };
+  const openMcpLog = async () => {
+    try { await api.openMcpLog(); }
+    catch (e) { errorMessage.value = describeError(e); }
+  };
   const narrow = (patch: Partial<ActivityFilter>) => replace({ kind: "activity", ...filter, ...patch });
   const refresh = () => narrow({at: new Date().toISOString()});
   const agentName = filter.agentId ? (agents.value.find(a => a.id === filter.agentId)?.name ?? hostName(filter.agentId)) : null;
@@ -88,6 +92,7 @@ function ActivityPage({ filter }: { filter: ActivityFilter }) {
   return <div class="screen pushed"><Screen log footer={
     <>
       <Button variant="quiet" onClick={() => void openLog()}>Open log</Button>
+      <Button variant="quiet" onClick={() => void openMcpLog()}>Open MCP traffic</Button>
       <Button busy={busy} disabled={!page || page.total === 0} onClick={() => void exportRows()}>Export</Button>
     </>
   }>
@@ -104,7 +109,7 @@ function ActivityPage({ filter }: { filter: ActivityFilter }) {
         <button type="button" class="link" onClick={refresh}>{latest && page && latest.at > page.window.snapshot_at ? "New actions · Refresh" : "Refresh"}</button>
       </div>
       {chips.length ? <div class="filters">{chips.map(c => <button type="button" class="filter" key={c.key} onClick={() => narrow({[c.key]: undefined})} title="Remove this filter"><Chip>{c.text}</Chip><CloseIcon /></button>)}</div> : null}
-      <p class="hint">Retained events only · up to 30 days / 20 MiB.</p>
+      <p class="hint">Retained events only · up to 30 days.</p>
       {saved ? <p class="hint" role="status">{saved}</p> : null}
       {failed ? <Button variant="quiet" onClick={refresh}>Retry history</Button> : page === null ? <div class="muted small">Loading…</div> : rows.length === 0 ? <div class="muted small">Nothing here.</div> : (
         <>

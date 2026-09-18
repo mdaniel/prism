@@ -316,10 +316,9 @@ impl BackendManager {
         client
             .call_tool(call_params(name, arguments))
             .await
-            .map_err(|_| {
-                Error::Backend(
-                    "tool call failed; server error details omitted to protect credentials".into(),
-                )
+            .map_err(|err| {
+                tracing::warn!(server = server_id, tool = name, error = %err, "backend tool call failed");
+                Error::Backend("tool call failed: server error details omitted to protect credentials".into())
             })
     }
 
