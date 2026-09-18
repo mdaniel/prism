@@ -17,6 +17,7 @@ import type {
   PendingCall,
   PendingSignIn,
   Rule,
+  ServerHookConfig,
   ServerView,
   Settings,
   ToolInfo,
@@ -224,6 +225,11 @@ export const mock = {
   },
   sign_out_server: (a: { serverId: string }) => { servers.find((x) => x.id === a.serverId)!.status = { kind: "sign_in_required" }; return delay(undefined); },
   remove_server: (a: { serverId: string }) => { servers.splice(servers.findIndex((s) => s.id === a.serverId), 1); return delay(undefined); },
+  set_server_hook: (a: { serverId: string; hook: ServerHookConfig | null }) => {
+    const s = servers.find((x) => x.id === a.serverId);
+    if (s) s.hook = a.hook;
+    return delay(s);
+  },
   restart_server: () => delay(undefined),
   list_agents: () => delay(agents),
   create_manual_agent: (a: { name: string }) => {

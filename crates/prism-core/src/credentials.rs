@@ -391,6 +391,7 @@ pub(crate) mod tests {
             headers: Default::default(),
             oauth_ref: None,
             hidden_tools: Default::default(),
+            hook: None,
         }
     }
 

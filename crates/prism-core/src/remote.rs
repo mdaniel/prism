@@ -153,15 +153,27 @@ pub(crate) async fn connect(
         HttpAuth::None | HttpAuth::Header => {
             let transport =
                 StreamableHttpClientTransport::with_client(http_client()?, transport_config);
-            let logged = crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic);
-            handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
+            if let Some(ref hook) = config.hook {
+                let hooked = crate::hook_transport::ServerHookTransport::new(transport, config.clone(), hook.clone());
+                let logged = crate::mcp_traffic::ServerLoggingTransport::new(hooked, config.id.clone(), traffic);
+                handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
+            } else {
+                let logged = crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic);
+                handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
+            }
         }
         HttpAuth::Oauth => {
             let manager = authorized_manager(config, store).await?;
             let client = AuthClient::new(http_client()?, manager);
             let transport = StreamableHttpClientTransport::with_client(client, transport_config);
-            let logged = crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic);
-            handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
+            if let Some(ref hook) = config.hook {
+                let hooked = crate::hook_transport::ServerHookTransport::new(transport, config.clone(), hook.clone());
+                let logged = crate::mcp_traffic::ServerLoggingTransport::new(hooked, config.id.clone(), traffic);
+                handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
+            } else {
+                let logged = crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic);
+                handshake(Upstream::default().serve_with_lifecycle(logged, remote_lifecycle())).await
+            }
         }
     }
 }
@@ -783,6 +795,7 @@ mod tests {
             headers,
             oauth_ref: None,
             hidden_tools: Default::default(),
+            hook: None,
         }
     }
 

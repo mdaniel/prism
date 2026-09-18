@@ -590,10 +590,26 @@ async fn connect(
             });
         }
 
-        let logged_transport =
-            crate::mcp_traffic::ServerLoggingTransport::new(transport, config.id.clone(), traffic.clone());
-        let serve_res =
-            tokio::time::timeout(REFRESH_TIMEOUT, Upstream::default().serve(logged_transport)).await;
+        let serve_res = if let Some(ref hook) = config.hook {
+            let hooked = crate::hook_transport::ServerHookTransport::new(
+                transport,
+                config.clone(),
+                hook.clone(),
+            );
+            let logged = crate::mcp_traffic::ServerLoggingTransport::new(
+                hooked,
+                config.id.clone(),
+                traffic.clone(),
+            );
+            tokio::time::timeout(REFRESH_TIMEOUT, Upstream::default().serve(logged)).await
+        } else {
+            let logged = crate::mcp_traffic::ServerLoggingTransport::new(
+                transport,
+                config.id.clone(),
+                traffic.clone(),
+            );
+            tokio::time::timeout(REFRESH_TIMEOUT, Upstream::default().serve(logged)).await
+        };
 
         match serve_res {
             Ok(Ok(client)) => client,
@@ -757,6 +773,8 @@ pub struct ServerView {
     pub auth: crate::config::HttpAuth,
     /// Tools the panel hid from every agent, by name.
     pub hidden_tools: Vec<String>,
+    /// Subprocess hook configuration, if any.
+    pub hook: Option<crate::config::ServerHookConfig>,
 }
 
 impl ServerView {
@@ -773,6 +791,7 @@ impl ServerView {
             url: config.url,
             auth: config.auth,
             hidden_tools: config.hidden_tools.into_iter().collect(),
+            hook: config.hook,
         }
     }
 }
@@ -797,6 +816,7 @@ mod tests {
             headers: Default::default(),
             oauth_ref: None,
             hidden_tools: Default::default(),
+            hook: None,
         };
         let launch = crate::credentials::LaunchSettings {
             args: vec![
@@ -913,6 +933,7 @@ for line in sys.stdin:
                 headers: Default::default(),
                 oauth_ref: None,
                 hidden_tools: Default::default(),
+                hook: None,
             })
             .await
             .unwrap();
@@ -1003,6 +1024,7 @@ for line in sys.stdin:
             headers: Default::default(),
             oauth_ref: None,
             hidden_tools: Default::default(),
+            hook: None,
         };
         protect_server(store.as_ref(), &mut server).unwrap();
         let (events, _) = crate::events::channel();
@@ -1069,6 +1091,7 @@ sys.exit(1)
                 headers: Default::default(),
                 oauth_ref: None,
                 hidden_tools: Default::default(),
+                hook: None,
             })
             .await
             .unwrap();

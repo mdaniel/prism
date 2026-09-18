@@ -81,6 +81,15 @@ export interface ToolInfo {
   exposed: boolean;
 }
 
+export type HookDirection = "send" | "recv" | "both";
+
+export interface ServerHookConfig {
+  command: string;
+  args?: string[];
+  direction?: HookDirection;
+  timeout_secs?: number;
+}
+
 export interface ServerView {
   id: string;
   name: string;
@@ -95,6 +104,8 @@ export interface ServerView {
   auth: HttpAuth;
   /** Tools the panel hid from every agent, by name. */
   hidden_tools: string[];
+  /** Subprocess hook to intercept and patch MCP messages. */
+  hook?: ServerHookConfig | null;
 }
 
 export type AgentStatus = "pending" | "approved" | "denied";

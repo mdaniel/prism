@@ -2,8 +2,8 @@ import { useEffect, useRef, useState } from "preact/hooks";
 import * as api from "../api";
 import { persistExposure, serverPrimaryAction, toolExposureActions } from "../server-actions";
 import { errorMessage, pop, servers, status, toolRevisions } from "../state";
-import type { ToolInfo } from "../types";
-import { Button, Chip, ConfirmButton, Label, REVEAL, Screen, ShowMore, StatusText, Switch, describeError, useReveal } from "../ui";
+import type { HookDirection, ServerHookConfig, ServerView, ToolInfo } from "../types";
+import { Button, Chip, ConfirmButton, Label, REVEAL, Screen, Segmented, ShowMore, StatusText, Switch, describeError, useReveal } from "../ui";
 import { authenticationGuidance, refreshServers, serverWhere, statusChip } from "./Servers";
 
 /** One server as its own screen: what it is, which of its tools agents get, and the few things you can do to it. */
@@ -142,7 +142,159 @@ export function ServerScreen({ serverId }: { serverId: string }) {
           )}
           {running && tools && tools.length > 0 ? <p class="hint">A hidden tool is not listed to any agent and cannot be called.</p> : null}
         </section>
+
+        <HookSection server={server} busy={busy} onSave={async (hook) => {
+          await act(async () => {
+            const updated = await api.setServerHook(server.id, hook);
+            servers.value = servers.value.map((s) => (s.id === updated.id ? updated : s));
+          });
+        }} />
       </Screen>
     </div>
+  );
+}
+
+function HookSection({
+  server,
+  busy,
+  onSave,
+}: {
+  server: ServerView;
+  busy: boolean;
+  onSave: (hook: ServerHookConfig | null) => Promise<void>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [command, setCommand] = useState(server.hook?.command ?? "");
+  const [args, setArgs] = useState((server.hook?.args ?? []).join(" "));
+  const [direction, setDirection] = useState<HookDirection>(server.hook?.direction ?? "send");
+  const [timeoutSecs, setTimeoutSecs] = useState(server.hook?.timeout_secs ?? 10);
+
+  useEffect(() => {
+    setCommand(server.hook?.command ?? "");
+    setArgs((server.hook?.args ?? []).join(" "));
+    setDirection(server.hook?.direction ?? "send");
+    setTimeoutSecs(server.hook?.timeout_secs ?? 10);
+  }, [server.hook]);
+
+  const save = async () => {
+    const trimmed = command.trim();
+    if (!trimmed) {
+      await onSave(null);
+      setEditing(false);
+      return;
+    }
+    const parsedArgs = args.trim() ? args.trim().split(/\s+/) : [];
+    await onSave({
+      command: trimmed,
+      args: parsedArgs,
+      direction,
+      timeout_secs: Number(timeoutSecs) || 10,
+    });
+    setEditing(false);
+  };
+
+  const remove = async () => {
+    await onSave(null);
+    setEditing(false);
+  };
+
+  return (
+    <section class="section">
+      <Label right={server.hook ? <Chip tone="accent">{server.hook.direction}</Chip> : null}>
+        Message Hook
+      </Label>
+      {!editing && server.hook ? (
+        <div class="list">
+          <div class="item">
+            <div class="title">
+              <span class="mono small truncate">
+                {server.hook.command} {server.hook.args?.join(" ")}
+              </span>
+              <Chip>{server.hook.timeout_secs ?? 10}s</Chip>
+            </div>
+            <div class="side" style="display: flex; gap: 4px;">
+              <Button variant="quiet" disabled={busy} onClick={() => setEditing(true)}>
+                Edit
+              </Button>
+              <ConfirmButton
+                variant="quiet"
+                class="danger"
+                confirm="Remove?"
+                disabled={busy}
+                onConfirm={() => void remove()}
+              >
+                Remove
+              </ConfirmButton>
+            </div>
+          </div>
+          <p class="hint">Subprocess intercepts raw JSON-RPC messages via stdin/stdout (rc=0 patch, rc=2 deny).</p>
+        </div>
+      ) : !editing ? (
+        <div>
+          <p class="hint">No subprocess hook configured for this server.</p>
+          <Button variant="quiet" disabled={busy} onClick={() => setEditing(true)}>
+            + Configure Hook
+          </Button>
+        </div>
+      ) : (
+        <div class="fields" style="margin-top: 8px;">
+          <label class="field">
+            <span>Executable / Command</span>
+            <input
+              class="input mono"
+              placeholder="/path/to/hook.sh or python3"
+              value={command}
+              onInput={(e) => setCommand((e.currentTarget as HTMLInputElement).value)}
+              disabled={busy}
+            />
+          </label>
+          <label class="field">
+            <span>Arguments</span>
+            <input
+              class="input mono"
+              placeholder="e.g. -u /path/to/filter.py"
+              value={args}
+              onInput={(e) => setArgs((e.currentTarget as HTMLInputElement).value)}
+              disabled={busy}
+            />
+          </label>
+          <div class="field">
+            <span>Traffic Direction</span>
+            <Segmented
+              small
+              label="Direction"
+              value={direction}
+              options={[
+                { value: "send", label: "Outgoing (Requests)" },
+                { value: "recv", label: "Incoming (Responses)" },
+                { value: "both", label: "Both" },
+              ]}
+              onChange={(next) => setDirection(next as HookDirection)}
+            />
+          </div>
+          <label class="field">
+            <span>Timeout</span>
+            <input
+              class="input mono"
+              type="number"
+              min={1}
+              max={120}
+              value={timeoutSecs}
+              onInput={(e) => setTimeoutSecs(Number((e.currentTarget as HTMLInputElement).value) || 10)}
+              disabled={busy}
+            />
+            <small>Seconds before hook is killed.</small>
+          </label>
+          <div style="display: flex; gap: 8px; margin-top: 8px;">
+            <Button variant="primary" busy={busy} onClick={() => void save()}>
+              Save Hook
+            </Button>
+            <Button variant="quiet" disabled={busy} onClick={() => setEditing(false)}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
+    </section>
   );
 }

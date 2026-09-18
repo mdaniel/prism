@@ -533,6 +533,37 @@ impl Gateway {
         self.backends.restart(server_id).await
     }
 
+    /// Update the subprocess message hook for an upstream server, persist config, and restart the server.
+    pub async fn set_server_hook(
+        &self,
+        server_id: &str,
+        hook: Option<crate::config::ServerHookConfig>,
+    ) -> Result<ServerView> {
+        let server_config = {
+            let mut config = self.config.write().await;
+            let mut updated = config.clone();
+            let server_clone = {
+                let server = updated
+                    .servers
+                    .iter_mut()
+                    .find(|s| s.id == server_id)
+                    .ok_or_else(|| Error::NotFound(format!("server {server_id}")))?;
+                server.hook = hook;
+                server.clone()
+            };
+            updated.save(&self.config_path)?;
+            *config = updated;
+            server_clone
+        };
+        self.backends.stop(server_id).await;
+        self.backends.start(server_config).await;
+        self.servers()
+            .await
+            .into_iter()
+            .find(|s| s.id == server_id)
+            .ok_or_else(|| Error::NotFound(format!("server {server_id}")))
+    }
+
     /// Show or hide one tool of a server for every agent. Saved to config; the next list or call sees it.
     pub async fn set_tool_exposed(&self, server_id: &str, tool: &str, exposed: bool) -> Result<()> {
         let mut config = self.config.write().await;
@@ -2676,6 +2707,7 @@ mod retained_history_tests {
                 headers: Default::default(),
                 oauth_ref: None,
                 hidden_tools: Default::default(),
+                hook: None,
             });
         }
         assert!(gw.set_tool_exposed("missing", "x", false).await.is_err());

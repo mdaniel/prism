@@ -9,6 +9,7 @@ mod credentials;
 mod error;
 mod events;
 mod gateway;
+pub mod hook_transport;
 mod http_security;
 mod listener;
 pub mod native;
@@ -19,6 +20,7 @@ mod remote;
 mod shell_path;
 mod storage;
 
+pub use hook_transport::{run_hook, HookOutcome, ServerHookTransport};
 pub use mcp_traffic::{McpTrafficLogger, McpTransaction, ServerLoggingTransport};
 
 pub use approval::{
@@ -31,8 +33,8 @@ pub use audit::{
 };
 pub use backend::{BackendStatus, ServerView};
 pub use config::{
-    AgentConfig, AgentStatus, Attention, HttpAuth, ListenAddress, PanelAnchor, Posture,
-    PrismConfig, Rule, RuleDecision, RuleScope, ServerConfig, TimeoutBehavior,
+    AgentConfig, AgentStatus, Attention, HookDirection, HttpAuth, ListenAddress, PanelAnchor, Posture,
+    PrismConfig, Rule, RuleDecision, RuleScope, ServerConfig, ServerHookConfig, TimeoutBehavior,
 };
 pub use config::{OAuthClient, TokenKind, TokenRecord};
 pub use error::{Error, Result};

@@ -39,6 +39,49 @@ pub struct ServerConfig {
     /// Tools the panel keeps from every agent: not listed, and refused as unknown if called.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub hidden_tools: BTreeSet<String>,
+    /// Subprocess hook command to intercept and patch MCP messages for this server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook: Option<ServerHookConfig>,
+}
+
+/// Direction of MCP JSON-RPC traffic to intercept.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDirection {
+    #[default]
+    Send,
+    Recv,
+    Both,
+}
+
+impl HookDirection {
+    pub fn intercepts_send(&self) -> bool {
+        matches!(self, HookDirection::Send | HookDirection::Both)
+    }
+
+    pub fn intercepts_recv(&self) -> bool {
+        matches!(self, HookDirection::Recv | HookDirection::Both)
+    }
+}
+
+fn default_hook_direction() -> HookDirection {
+    HookDirection::Send
+}
+
+fn default_hook_timeout() -> u64 {
+    10
+}
+
+/// A subprocess hook that intercepts and can patch raw MCP JSON-RPC messages for an upstream server.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerHookConfig {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default = "default_hook_direction")]
+    pub direction: HookDirection,
+    #[serde(default = "default_hook_timeout")]
+    pub timeout_secs: u64,
 }
 
 impl ServerConfig {
@@ -686,6 +729,7 @@ mod tests {
                 headers: Default::default(),
                 oauth_ref: None,
                 hidden_tools: ["delete_file".to_string()].into_iter().collect(),
+                hook: None,
                 enabled: true,
             }],
             agents: vec![AgentConfig {

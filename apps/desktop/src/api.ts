@@ -30,6 +30,7 @@ import type {
   PendingSignIn,
   Posture,
   Rule,
+  ServerHookConfig,
   ServerView,
   Settings,
   ToolInfo,
@@ -54,10 +55,15 @@ export interface AddServerArgs {
   url?: string;
   auth?: HttpAuth;
   headers?: Record<string, string>;
+  hook?: ServerHookConfig | null;
 }
 
 export function addServer(args: AddServerArgs) {
   return invoke<ServerView>("add_server", { args });
+}
+
+export function setServerHook(serverId: string, hook: ServerHookConfig | null) {
+  return invoke<ServerView>("set_server_hook", { serverId, hook });
 }
 
 export function removeServer(serverId: string) {

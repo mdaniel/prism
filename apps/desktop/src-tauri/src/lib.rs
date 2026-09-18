@@ -617,6 +617,8 @@ struct AddServerArgs {
     auth: prism_core::HttpAuth,
     #[serde(default)]
     headers: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    hook: Option<prism_core::ServerHookConfig>,
 }
 
 #[tauri::command]
@@ -634,6 +636,7 @@ async fn add_server(state: State<'_, AppState>, args: AddServerArgs) -> Result<S
         headers: args.headers,
         oauth_ref: None,
         hidden_tools: Default::default(),
+        hook: args.hook,
     };
     let added = state.gateway.add_server(server).await.map_err(map_err)?;
     state
@@ -643,6 +646,19 @@ async fn add_server(state: State<'_, AppState>, args: AddServerArgs) -> Result<S
         .into_iter()
         .find(|server| server.id == added.id)
         .ok_or_else(|| "server is no longer configured".to_string())
+}
+
+#[tauri::command]
+async fn set_server_hook(
+    state: State<'_, AppState>,
+    server_id: String,
+    hook: Option<prism_core::ServerHookConfig>,
+) -> Result<ServerView, String> {
+    state
+        .gateway
+        .set_server_hook(&server_id, hook)
+        .await
+        .map_err(map_err)
 }
 
 #[tauri::command]
@@ -1686,6 +1702,7 @@ pub fn run() {
             add_server,
             remove_server,
             restart_server,
+            set_server_hook,
             sign_in_server,
             sign_out_server,
             list_agents,
