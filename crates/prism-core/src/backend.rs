@@ -333,7 +333,7 @@ impl BackendManager {
             .await
             .map_err(|err| {
                 tracing::warn!(server = server_id, tool = name, error = %err, "backend tool call failed");
-                Error::Backend("tool call failed: server error details omitted to protect credentials".into())
+                Error::Backend(format!("tool call failed: {err}"))
             })
     }
 
@@ -401,11 +401,11 @@ fn supports_updates(peer: &Peer<RoleClient>) -> bool {
 async fn list_peer_tools(peer: &Peer<RoleClient>) -> Result<Vec<Tool>> {
     let mut tools = tokio::time::timeout(REFRESH_TIMEOUT, peer.list_all_tools())
         .await
-        .map_err(|_| Error::Backend("tool listing timed out".into()))?
-        .map_err(|_| {
-            Error::Backend(
-                "tool listing failed; server error details omitted to protect credentials".into(),
-            )
+        .map_err(|err| Error::Backend(format!("tool listing timed out: {err}")))?
+        .map_err(|err| {
+            Error::Backend(format!(
+                "tool listing failed: {err}"
+            ))
         })?;
     tools.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(tools)
